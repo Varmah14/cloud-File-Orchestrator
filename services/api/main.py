@@ -20,6 +20,7 @@ storage_client = storage.Client()
 pubsub_client = pubsub_v1.PublisherClient()
 firestore_client = firestore.Client(project=GCP_PROJECT_ID)
 
+
 # Helper: Pub/Sub topic path
 def topic_path(topic_name: str) -> str:
     return pubsub_client.topic_path(GCP_PROJECT_ID, topic_name)
@@ -28,6 +29,11 @@ def topic_path(topic_name: str) -> str:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/")
+def root():
+    return {"status": "API is running"}
 
 
 @app.post("/upload")
