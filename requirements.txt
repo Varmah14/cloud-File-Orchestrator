@@ -1,8 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
+python-multipart
 
 google-cloud-storage
 google-cloud-pubsub
 google-cloud-firestore
-puremagic==1.30
+
 pydantic

@@ -2,6 +2,7 @@
 import base64
 import json
 import datetime as dt
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -24,12 +25,22 @@ def topic_path(topic_name: str) -> str:
     return pubsub_client.topic_path(GCP_PROJECT_ID, topic_name)
 
 
-def simple_classification(mime_type: str) -> str:
-    """Return a prefix based on mime_type."""
-    if "pdf" in mime_type:
+def simple_classification(mime_type: str, blob: str) -> str:
+    """Better classification using both mime type and file extension."""
+    mime = (mime_type or "").lower()
+    blob_lower = blob.lower()
+
+    _, ext = os.path.splitext(blob_lower)
+
+    if "pdf" in mime or ext == ".pdf":
         return "docs/"
-    if mime_type.startswith("image/"):
+
+    if mime.startswith("image/") or ext in [".png", ".jpg", ".jpeg", ".gif", ".webp"]:
         return "images/"
+
+    if mime.startswith("text/") or ext in [".txt", ".md"]:
+        return "text/"
+
     return "others/"
 
 
@@ -52,14 +63,13 @@ async def pubsub_push(request: Request):
     blob = event["blob"]
     mime_type = event["mime_type"]
 
-    target_prefix = simple_classification(mime_type)
+    target_prefix = simple_classification(mime_type, blob)
 
     classification = {
         "mime_type": mime_type,
         "target_prefix": target_prefix,
     }
 
-    # Update job in Firestore
     now = dt.datetime.utcnow().isoformat() + "Z"
     job_ref = firestore_client.collection(JOBS_COLLECTION).document(job_id)
     job_ref.update(
@@ -70,7 +80,6 @@ async def pubsub_push(request: Request):
         }
     )
 
-    # Publish to act topic (for act worker)
     act_event = {
         "job_id": job_id,
         "bucket": bucket,

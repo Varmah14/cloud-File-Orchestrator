@@ -4,6 +4,5 @@ google-cloud-storage
 google-cloud-pubsub
 google-cloud-firestore
 python-multipart
-python-magic
 PyPDF2
 pillow
