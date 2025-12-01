@@ -207,6 +207,14 @@ Our repo includes unit tests validating `/pubsub-push` for all workers.
 
 ```bash
 gcloud builds submit --tag gcr.io/$PROJECT_ID/inspect-worker
+gcloud run deploy inspect-worker \
+  --image gcr.io/$PROJECT_ID/inspect-worker \
+  --region us-central1 --platform managed
+```
+
+### deploy inspect_worker
+
+```bash
 gcloud run deploy cfo-inspect-worker --source . --region=$REGION --allow-unauthenticated
 ```
 
