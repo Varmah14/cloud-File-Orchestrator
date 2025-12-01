@@ -438,19 +438,39 @@ async def pubsub_push(request: Request):
     mime_type = detect_mime_type(blob)
     file_size = blob.size or 0
 
-    # Update Firestore
+    # # Update Firestore
+    # doc_ref = db.collection(JOBS_COLLECTION).document(job_id)
+    # doc_ref.set(
+    #     {
+    #         "inspection": {
+    #             "mime_type": mime_type,
+    #             "file_size": file_size,
+    #             "inspected_at": dt.datetime.utcnow().isoformat() + "Z",
+    #         },
+    #         "status": "INSPECTED",
+    #         "updated_at": dt.datetime.utcnow().isoformat() + "Z",
+    #     },
+    #     merge=True,
+    # )
+
     doc_ref = db.collection(JOBS_COLLECTION).document(job_id)
+    now = dt.datetime.utcnow().isoformat() + "Z"
+
     doc_ref.set(
         {
+            "source": {
+                "bucket": bucket_name,
+                "blob": blob_name,
+            },
             "inspection": {
                 "mime_type": mime_type,
                 "file_size": file_size,
-                "inspected_at": dt.datetime.utcnow().isoformat() + "Z",
+                "inspected_at": now,
             },
             "status": "INSPECTED",
-            "updated_at": dt.datetime.utcnow().isoformat() + "Z",
+            "updated_at": now,
         },
-        merge=True,
+        merge=True,  # keep everything else unchanged
     )
 
     # Forward

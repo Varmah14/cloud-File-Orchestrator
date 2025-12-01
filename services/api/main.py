@@ -11,13 +11,9 @@ from pydantic import BaseModel
 
 from google.cloud import storage, firestore
 
-from common.config import GCP_PROJECT_ID
+from common.config import GCP_PROJECT_ID, JOBS_COLLECTION  # <- added JOBS_COLLECTION
 
-# at the top of api/main.py
-import re
-
-
-...
+import re  # (unused but harmless if you had it before)
 
 # -----------------------------------------------------------------------------
 # App + CORS (for UI)
@@ -109,7 +105,7 @@ class RuleUpdate(BaseModel):
     actions: Optional[List[RuleAction]] = None
 
 
-# simple in-memory activity store (optional)
+# simple in-memory activity store (no longer used, but kept so nothing else breaks)
 ACTIVITY_DB: List[dict] = []
 
 # -----------------------------------------------------------------------------
@@ -255,6 +251,32 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 # -----------------------------------------------------------------------------
+# Activity helpers
+# -----------------------------------------------------------------------------
+
+
+def _map_status_to_ui(
+    status: Optional[str],
+) -> Literal["pending", "processed", "error"]:
+    """
+    Map Firestore job.status → UI status enum:
+      pending | processed | error
+    """
+    if not status:
+        return "processed"
+
+    s = status.upper()
+
+    if s in {"NEW", "PENDING", "QUEUED", "INSPECTED", "CLASSIFIED"}:
+        return "pending"
+    if s in {"ERROR", "FAILED"}:
+        return "error"
+
+    # COMPLETED and everything else → processed
+    return "processed"
+
+
+# -----------------------------------------------------------------------------
 # Root + Activity
 # -----------------------------------------------------------------------------
 
@@ -270,8 +292,64 @@ def root():
 @app.get("/activity", response_model=List[ActivityEvent])
 def list_activity(limit: int = 20) -> List[ActivityEvent]:
     """
-    Return recent file processing events (in-memory for now).
-    Later you can wire this up to Firestore or logs.
+    Return recent file processing events based on Firestore jobs.
+
+    We read from the same JOBS_COLLECTION that workers update
+    (status, classification, action, etc.) and map each doc to the
+    ActivityEvent shape expected by the UI.
     """
-    sorted_events = sorted(ACTIVITY_DB, key=lambda e: e["timestamp"], reverse=True)
-    return [ActivityEvent(**e) for e in sorted_events[:limit]]
+    events: List[ActivityEvent] = []
+
+    # newest first
+    query = (
+        db.collection(JOBS_COLLECTION)
+        .order_by("updated_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+    )
+
+    for doc in query.stream():
+        data = doc.to_dict() or {}
+        job_id = doc.id
+
+        # Pick a timestamp (updated_at > created_at > now)
+        ts_str = data.get("updated_at") or data.get("created_at")
+        if ts_str:
+            # strip trailing Z if present
+            ts = datetime.fromisoformat(ts_str.replace("Z", ""))
+        else:
+            ts = datetime.utcnow()
+
+        source = data.get("source", {}) or {}
+        action = data.get("action", {}) or {}
+        classification = data.get("classification", {}) or {}
+
+        bucket = (
+            action.get("dest_bucket") or source.get("bucket") or SOURCE_BUCKET or ""
+        )
+        obj = action.get("dest_blob") or source.get("blob") or ""
+
+        raw_status = data.get("status", "COMPLETED")
+        ui_status = _map_status_to_ui(raw_status)
+
+        rule_name = classification.get("matched_rule") or data.get("rule_name")
+
+        actions_list: List[str] = []
+        if classification.get("label"):
+            actions_list.append(f"classified:{classification['label']}")
+        if action.get("dest_folder"):
+            actions_list.append(f"moved_to:{action['dest_folder']}")
+
+        events.append(
+            ActivityEvent(
+                id=job_id,
+                timestamp=ts,
+                bucket=bucket,
+                object=obj,
+                status=ui_status,
+                rule_name=rule_name,
+                actions=actions_list,
+                error_message=data.get("error_message"),
+            )
+        )
+
+    return events
