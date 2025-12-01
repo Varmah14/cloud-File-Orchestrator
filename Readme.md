@@ -256,7 +256,7 @@ Repeat for classify + act workers.
 
 ---
 
-# 🧪 Running Tests
+# Running Tests
 
 ```bash
 pytest
