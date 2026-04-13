@@ -1,185 +1,4 @@
-# # services/inspect_worker/main.py
-# import base64
-# import json
-# import datetime as dt
-# import os
-# import logging
 
-# from fastapi import FastAPI, Request
-# from fastapi.responses import Response
-
-# from google.cloud import storage, pubsub_v1, firestore
-
-# from common.config import (
-#     GCP_PROJECT_ID,
-#     CLASSIFY_TOPIC,
-#     JOBS_COLLECTION,
-# )
-
-# # ------------------------------------------------------------------------------
-# # MIME detection helpers
-# # ------------------------------------------------------------------------------
-
-# # Try to import pure-magic (optional dependency)
-# try:
-#     import puremagic  # from pure-magic
-
-#     HAS_PUREMAGIC = True
-#     logging.info("pure-magic loaded successfully in inspect worker")
-# except ImportError:
-#     HAS_PUREMAGIC = False
-#     logging.warning("pure-magic not installed—falling back to other methods")
-
-# # Static fallback for common extensions
-# EXTENSION_MAP = {
-#     ".pdf": "application/pdf",
-#     ".txt": "text/plain",
-#     ".csv": "text/csv",
-#     ".json": "application/json",
-#     ".xml": "application/xml",
-#     ".doc": "application/msword",
-#     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-#     ".xls": "application/vnd.ms-excel",
-#     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-#     ".ppt": "application/vnd.ms-powerpoint",
-#     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-#     ".png": "image/png",
-#     ".jpg": "image/jpeg",
-#     ".jpeg": "image/jpeg",
-#     ".gif": "image/gif",
-#     ".zip": "application/zip",
-# }
-
-
-# def detect_mime_type(blob, content_bytes: bytes) -> str:
-#     """
-#     Decide MIME type using (in order):
-#       1) pure-magic on the first 512 bytes (if available)
-#       2) GCS blob.content_type (if not octet-stream/None)
-#       3) File extension via EXTENSION_MAP
-#       4) Fallback: application/octet-stream
-#     """
-#     mime_type = None
-
-#     # 1) pure-magic from bytes
-#     if HAS_PUREMAGIC and content_bytes:
-#         try:
-#             header = content_bytes[:512]  # header is enough
-#             match = puremagic.from_string(header)
-#             logging.info(f"pure-magic match: {match}")
-
-#             # pure-magic returns a MagicMatch with `.mime`
-#             if match and hasattr(match, "mime"):
-#                 mime_type = match.mime  # e.g. "application/pdf"
-#                 logging.info(f"Detected MIME via pure-magic: {mime_type}")
-#         except Exception as e:
-#             logging.error(f"pure-magic failed: {e}")
-#             mime_type = None
-
-#     # 2) GCS content_type
-#     if not mime_type:
-#         gcs_mime = blob.content_type
-#         if gcs_mime and gcs_mime != "application/octet-stream":
-#             mime_type = gcs_mime
-#             logging.info(f"Using GCS content_type: {mime_type}")
-#         else:
-#             logging.info("GCS content_type was None or octet-stream—skipping")
-
-#     # 3) Extension-based fallback
-#     if not mime_type:
-#         _, ext = os.path.splitext(blob.name.lower())
-#         mime_type = EXTENSION_MAP.get(ext)
-#         if mime_type:
-#             logging.info(f"Using extension fallback: {ext} -> {mime_type}")
-#         else:
-#             logging.warning(f"No extension match for {blob.name}")
-
-#     # 4) Final fallback
-#     mime_type = mime_type or "application/octet-stream"
-#     logging.info(f"Final MIME type for {blob.name}: {mime_type}")
-#     return mime_type
-
-
-# # ------------------------------------------------------------------------------
-# # FastAPI app + GCP clients
-# # ------------------------------------------------------------------------------
-
-# app = FastAPI()
-
-# storage_client = storage.Client()
-# pubsub_client = pubsub_v1.PublisherClient()
-# firestore_client = firestore.Client(project=GCP_PROJECT_ID)
-
-
-# def topic_path(topic_name: str) -> str:
-#     return pubsub_client.topic_path(GCP_PROJECT_ID, topic_name)
-
-
-# @app.post("/pubsub-push")
-# async def pubsub_push(request: Request):
-#     """
-#     Entry point for Pub/Sub push messages from the ingest topic.
-#     Expected envelope: {"message": {"data": "<base64-JSON>"}}
-#     """
-#     envelope = await request.json()
-#     if "message" not in envelope:
-#         return Response(status_code=400)
-
-#     msg = envelope["message"]
-#     data = msg.get("data")
-#     if data is None:
-#         return Response(status_code=400)
-
-#     payload_str = base64.b64decode(data).decode("utf-8")
-#     event = json.loads(payload_str)
-
-#     job_id = event["job_id"]
-#     bucket_name = event["bucket"]
-#     blob_name = event["blob"]
-
-#     # Download the full file once (we reuse bytes for size + MIME)
-#     bucket = storage_client.bucket(bucket_name)
-#     blob = bucket.blob(blob_name)
-#     content_bytes = blob.download_as_bytes()
-#     file_size = len(content_bytes)
-
-#     # Detect MIME type using our helper
-#     mime_type = detect_mime_type(blob, content_bytes)
-
-#     # Inspection metadata
-#     inspection = {
-#         "mime_type": mime_type,
-#         "file_size": file_size,
-#     }
-
-#     # Update Firestore job: set INSPECTED + inspection info
-#     now = dt.datetime.utcnow().isoformat() + "Z"
-#     job_ref = firestore_client.collection(JOBS_COLLECTION).document(job_id)
-#     job_ref.update(
-#         {
-#             "inspection": inspection,
-#             "status": "INSPECTED",
-#             "updated_at": now,
-#         }
-#     )
-
-#     # Publish event to classify topic
-#     classify_event = {
-#         "job_id": job_id,
-#         "bucket": bucket_name,
-#         "blob": blob_name,
-#         "mime_type": mime_type,
-#         "file_size": file_size,
-#     }
-#     classify_data = json.dumps(classify_event).encode("utf-8")
-#     pubsub_client.publish(topic_path(CLASSIFY_TOPIC), data=classify_data)
-
-#     # Pub/Sub push needs any 2xx
-#     return Response(status_code=204)
-
-
-# services/inspect_worker/main.py
-# services/inspect_worker/main.py
 
 import os
 import base64
@@ -424,19 +243,33 @@ async def pubsub_push(request: Request):
 
     # CRITICAL FIX: Only reload() if this is NOT a raw GCS event
     # Raw GCS events have "size" and "contentType" in payload
+    # if "size" in payload or "contentType" in payload:
+    #     # We already have fresh metadata from the event — trust it
+    #     pass
+    # else:
+    #     # Internal orchestrator event — safe to reload
+    #     try:
+    #         blob.reload()
+    #     except Exception as e:
+    #         logger.error(f"Failed to reload blob metadata: {e}")
+    #         return Response(status_code=500)
+
+    # mime_type = detect_mime_type(blob)
+    # # file_size = blob.size or 0
+
     if "size" in payload or "contentType" in payload:
-        # We already have fresh metadata from the event — trust it
-        pass
+        # Raw GCS event — use metadata directly from payload
+        file_size = int(payload.get("size", 0))
     else:
-        # Internal orchestrator event — safe to reload
+        # Internal orchestrator event — reload blob metadata
         try:
             blob.reload()
         except Exception as e:
             logger.error(f"Failed to reload blob metadata: {e}")
             return Response(status_code=500)
+        file_size = blob.size or 0
 
     mime_type = detect_mime_type(blob)
-    file_size = blob.size or 0
 
     # # Update Firestore
     # doc_ref = db.collection(JOBS_COLLECTION).document(job_id)
