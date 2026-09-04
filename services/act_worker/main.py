@@ -1,10 +1,10 @@
 # services/act_worker/main.py
 
+import asyncio
 import base64
 import json
 import datetime as dt
 import logging
-import os
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, Request
@@ -16,25 +16,25 @@ from common.config import (
     GCP_PROJECT_ID,
     UPLOAD_BUCKET,
     PROCESSED_BUCKET,
-    JOBS_COLLECTION,
     RULES_COLLECTION,
 )
+from common.idempotency import claim_stage, finalize_stage, ClaimResult
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
 app = FastAPI()
 storage_client = storage.Client()
-db = firestore.Client(project=GCP_PROJECT_ID)
+db = firestore.AsyncClient(project=GCP_PROJECT_ID)
 
 
 # -------------------------- Rule evaluation helpers --------------------------
 
 
-def load_rules() -> List[Dict[str, Any]]:
-    docs = db.collection(RULES_COLLECTION).where("enabled", "==", True).stream()
+async def load_rules() -> List[Dict[str, Any]]:
     rules: List[Dict[str, Any]] = []
-    for d in docs:
+    query = db.collection(RULES_COLLECTION).where("enabled", "==", True)
+    async for d in query.stream():
         data = d.to_dict() or {}
         data["id"] = d.id
         rules.append(data)
@@ -142,6 +142,21 @@ async def pubsub_push(request: Request):
         logger.warning(f"Act worker: missing required fields (job_id={job_id}, bucket={bucket_name}, blob={blob_name})")
         return Response(status_code=204)
 
+    message_id = message.get("messageId") or f"{job_id}:no-message-id"
+
+    claim = await claim_stage(
+        db,
+        job_id,
+        expected_prev_statuses={"CLASSIFIED"},
+        in_progress_status="ACT_IN_PROGRESS",
+        target_status="COMPLETED",
+        message_id=message_id,
+    )
+    if claim == ClaimResult.ALREADY_DONE:
+        return Response(status_code=204)
+    if claim == ClaimResult.LOCKED:
+        return Response(status_code=409)
+
     file_meta = {
         "job_id": job_id,
         "bucket": bucket_name,
@@ -153,7 +168,7 @@ async def pubsub_push(request: Request):
         "classification": classification,
     }
 
-    rules = load_rules()
+    rules = await load_rules()
     matched_rule = None
     applied = {
         "dest_bucket": PROCESSED_BUCKET,
@@ -172,21 +187,29 @@ async def pubsub_push(request: Request):
     src_bucket = storage_client.bucket(bucket_name)
     src_blob = src_bucket.blob(blob_name)
     filename = blob_name.split("/")[-1]
-    now = dt.datetime.utcnow().isoformat() + "Z"
-    doc_ref = db.collection(JOBS_COLLECTION).document(job_id)
 
-    # ── Idempotency check: if source is gone, job already processed ───────────
-    if not src_blob.exists():
+    # -- Idempotency check: if source is gone, job already processed (e.g. a
+    # retry after claim_stage reclaimed an expired lease from a crashed
+    # attempt that had already finished the real GCS move) --
+    if not await asyncio.to_thread(src_blob.exists):
         logger.info(f"Act worker: source blob already gone, marking COMPLETED (job_id={job_id})")
-        doc_ref.set({"status": "COMPLETED", "updated_at": now}, merge=True)
+        await finalize_stage(
+            db, job_id, "ACT_IN_PROGRESS", "COMPLETED", message_id, extra_fields={}
+        )
         return Response(status_code=204)
 
-    # ── Case: delete only ─────────────────────────────────────────────────────
+    # -- Case: delete only --
     if matched_rule and applied["delete_source_only"]:
         logger.info(f"Act worker: deleting gs://{bucket_name}/{blob_name}")
-        src_blob.delete()
-        doc_ref.set(
-            {
+        await asyncio.to_thread(src_blob.delete)
+        now = dt.datetime.utcnow().isoformat() + "Z"
+        await finalize_stage(
+            db,
+            job_id,
+            "ACT_IN_PROGRESS",
+            "COMPLETED",
+            message_id,
+            extra_fields={
                 "action": {
                     "action": "delete",
                     "rule_id": matched_rule.get("id"),
@@ -196,24 +219,22 @@ async def pubsub_push(request: Request):
                     "tags": applied["tags"],
                     "acted_at": now,
                 },
-                "status": "COMPLETED",
-                "updated_at": now,
             },
-            merge=True,
         )
         return Response(status_code=204)
 
-    # ── Case: move to processed bucket ───────────────────────────────────────
+    # -- Case: move to processed bucket --
     dest_bucket_name = applied["dest_bucket"] or PROCESSED_BUCKET
     dest_folder = applied["dest_folder"] or classification
     dest_bucket = storage_client.bucket(dest_bucket_name)
     dest_blob_name = f"{dest_folder}/{filename}"
 
-    logger.info(f"Act worker: moving gs://{bucket_name}/{blob_name} → gs://{dest_bucket_name}/{dest_blob_name}")
+    logger.info(f"Act worker: moving gs://{bucket_name}/{blob_name} -> gs://{dest_bucket_name}/{dest_blob_name}")
 
-    src_bucket.copy_blob(src_blob, dest_bucket, new_name=dest_blob_name)
-    src_blob.delete()
+    await asyncio.to_thread(src_bucket.copy_blob, src_blob, dest_bucket, dest_blob_name)
+    await asyncio.to_thread(src_blob.delete)
 
+    now = dt.datetime.utcnow().isoformat() + "Z"
     action_doc: Dict[str, Any] = {
         "dest_bucket": dest_bucket_name,
         "dest_blob": dest_blob_name,
@@ -226,13 +247,13 @@ async def pubsub_push(request: Request):
         action_doc["rule_id"] = matched_rule.get("id")
         action_doc["rule_name"] = matched_rule.get("name")
 
-    doc_ref.set(
-        {
-            "action": action_doc,
-            "status": "COMPLETED",
-            "updated_at": now,
-        },
-        merge=True,
+    await finalize_stage(
+        db,
+        job_id,
+        "ACT_IN_PROGRESS",
+        "COMPLETED",
+        message_id,
+        extra_fields={"action": action_doc},
     )
 
     return Response(status_code=204)
