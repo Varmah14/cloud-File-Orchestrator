@@ -1,5 +1,6 @@
 # services/classify_worker/main.py
 
+import asyncio
 import base64
 import json
 import logging
@@ -11,14 +12,15 @@ from fastapi.responses import Response
 
 from google.cloud import pubsub_v1, firestore
 
-from common.config import GCP_PROJECT_ID, ACT_TOPIC, JOBS_COLLECTION
+from common.config import GCP_PROJECT_ID, ACT_TOPIC
+from common.idempotency import claim_stage, finalize_stage, ClaimResult
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 publisher = pubsub_v1.PublisherClient()
-db = firestore.Client(project=GCP_PROJECT_ID)
+db = firestore.AsyncClient(project=GCP_PROJECT_ID)
 
 
 def topic_path(topic_name: str) -> str:
@@ -70,27 +72,24 @@ async def pubsub_push(request: Request):
         )
         return Response(status_code=204)
 
+    message_id = message.get("messageId") or f"{job_id}:no-message-id"
+
+    claim = await claim_stage(
+        db,
+        job_id,
+        expected_prev_statuses={"INSPECTED"},
+        in_progress_status="CLASSIFY_IN_PROGRESS",
+        target_status="CLASSIFIED",
+        message_id=message_id,
+    )
+    if claim == ClaimResult.ALREADY_DONE:
+        return Response(status_code=204)
+    if claim == ClaimResult.LOCKED:
+        return Response(status_code=409)
+
     _, ext = os.path.splitext(blob_name)
     classification = simple_classification(mime_type, ext)
 
-    # Update Firestore job (optional but nice)
-    doc_ref = db.collection(JOBS_COLLECTION).document(job_id)
-    doc_ref.set(
-        {
-            "classification": {
-                "classification": classification,
-                "mime_type": mime_type,
-                "file_size": file_size,
-                "ext": ext,
-                "classified_at": dt.datetime.utcnow().isoformat() + "Z",
-            },
-            "status": "CLASSIFIED",
-            "updated_at": dt.datetime.utcnow().isoformat() + "Z",
-        },
-        merge=True,
-    )
-
-    # Send to act worker with full metadata
     event = {
         "job_id": job_id,
         "bucket": bucket_name,
@@ -101,10 +100,28 @@ async def pubsub_push(request: Request):
         "ext": ext,
         "classification": classification,
     }
-
-    publisher.publish(
+    future = publisher.publish(
         topic_path(ACT_TOPIC),
         data=json.dumps(event).encode("utf-8"),
+    )
+    await asyncio.to_thread(future.result, timeout=30)
+
+    now = dt.datetime.utcnow().isoformat() + "Z"
+    await finalize_stage(
+        db,
+        job_id,
+        in_progress_status="CLASSIFY_IN_PROGRESS",
+        final_status="CLASSIFIED",
+        message_id=message_id,
+        extra_fields={
+            "classification": {
+                "classification": classification,
+                "mime_type": mime_type,
+                "file_size": file_size,
+                "ext": ext,
+                "classified_at": now,
+            },
+        },
     )
 
     return Response(status_code=204)
