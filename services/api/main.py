@@ -5,15 +5,15 @@ import uuid
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import firebase_admin
+from firebase_admin import auth as firebase_auth
 from google.cloud import storage, firestore
 
-from common.config import GCP_PROJECT_ID, JOBS_COLLECTION  # <- added JOBS_COLLECTION
-
-import re  # (unused but harmless if you had it before)
+from common.config import GCP_PROJECT_ID
 
 # -----------------------------------------------------------------------------
 # App + CORS (for UI)
@@ -46,7 +46,35 @@ if not SOURCE_BUCKET:
 storage_client = storage.Client()
 db = firestore.Client(project=GCP_PROJECT_ID)
 
-RULES_COLLECTION = os.getenv("RULES_COLLECTION", "rules")
+if not firebase_admin._apps:
+    firebase_admin.initialize_app()
+
+
+# -----------------------------------------------------------------------------
+# Auth: verify Firebase ID tokens (Google Sign-In), scope every request to
+# the caller's own uid. Cloud Run itself stays allow-unauthenticated at the
+# IAM layer -- this dependency is the real gate.
+# -----------------------------------------------------------------------------
+
+
+async def require_uid(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        decoded = firebase_auth.verify_id_token(token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
+    return decoded["uid"]
+
+
+def user_rules_ref(uid: str):
+    return db.collection("users").document(uid).collection("rules")
+
+
+def user_jobs_ref(uid: str):
+    return db.collection("users").document(uid).collection("jobs")
+
 
 # -----------------------------------------------------------------------------
 # Models: Rules & Activity
@@ -105,9 +133,6 @@ class RuleUpdate(BaseModel):
     actions: Optional[List[RuleAction]] = None
 
 
-# simple in-memory activity store (no longer used, but kept so nothing else breaks)
-ACTIVITY_DB: List[dict] = []
-
 # -----------------------------------------------------------------------------
 # Health
 # -----------------------------------------------------------------------------
@@ -119,17 +144,16 @@ def health():
 
 
 # -----------------------------------------------------------------------------
-# Rules API (Firestore-backed)
+# Rules API (Firestore-backed, scoped to users/{uid}/rules)
 # -----------------------------------------------------------------------------
 
 
 @app.get("/rules", response_model=List[Rule])
-def list_rules() -> List[Rule]:
+def list_rules(uid: str = Depends(require_uid)) -> List[Rule]:
     """
-    List rules sorted by priority ascending.
-    Backed by Firestore: collection RULES_COLLECTION (default 'rules').
+    List the caller's own rules, sorted by priority ascending.
     """
-    docs = db.collection(RULES_COLLECTION).order_by("priority").stream()
+    docs = user_rules_ref(uid).order_by("priority").stream()
     rules: List[Rule] = []
     for d in docs:
         data = d.to_dict() or {}
@@ -139,13 +163,12 @@ def list_rules() -> List[Rule]:
 
 
 @app.post("/rules", response_model=Rule)
-def create_rule(rule: RuleCreate) -> Rule:
+def create_rule(rule: RuleCreate, uid: str = Depends(require_uid)) -> Rule:
     """
-    Create a new rule in Firestore.
+    Create a new rule under the caller's own rules subcollection.
     """
-    doc_ref = db.collection(RULES_COLLECTION).document()
-    doc_data = rule.dict()
-    doc_ref.set(doc_data)
+    doc_ref = user_rules_ref(uid).document()
+    doc_ref.set(rule.dict())
 
     stored = doc_ref.get().to_dict() or {}
     stored["id"] = doc_ref.id
@@ -153,11 +176,14 @@ def create_rule(rule: RuleCreate) -> Rule:
 
 
 @app.put("/rules/{rule_id}", response_model=Rule)
-def update_rule(rule_id: str, patch: RuleUpdate) -> Rule:
+def update_rule(rule_id: str, patch: RuleUpdate, uid: str = Depends(require_uid)) -> Rule:
     """
-    Update an existing rule (partial update).
+    Update one of the caller's own rules (partial update). Ownership is
+    enforced structurally: the path is always users/{uid}/rules/... where
+    uid comes from the verified token, never from client input, so there's
+    no rule_id namespace shared across users to accidentally cross into.
     """
-    ref = db.collection(RULES_COLLECTION).document(rule_id)
+    ref = user_rules_ref(uid).document(rule_id)
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -171,11 +197,11 @@ def update_rule(rule_id: str, patch: RuleUpdate) -> Rule:
 
 
 @app.delete("/rules/{rule_id}")
-def delete_rule(rule_id: str):
+def delete_rule(rule_id: str, uid: str = Depends(require_uid)):
     """
-    Delete a rule by id.
+    Delete one of the caller's own rules by id.
     """
-    ref = db.collection(RULES_COLLECTION).document(rule_id)
+    ref = user_rules_ref(uid).document(rule_id)
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -184,22 +210,26 @@ def delete_rule(rule_id: str):
 
 
 @app.post("/rules/reorder")
-def reorder_rules(order: List[str] = Body(...)):
+def reorder_rules(order: List[str] = Body(...), uid: str = Depends(require_uid)):
     """
-    Reorder rules by IDs.
+    Reorder the caller's own rules by IDs.
     Body: ["rule-id-1", "rule-id-2", ...]
     Sets `priority` to index in list.
     """
     batch = db.batch()
     for idx, rid in enumerate(order):
-        ref = db.collection(RULES_COLLECTION).document(rid)
+        ref = user_rules_ref(uid).document(rid)
         batch.set(ref, {"priority": idx}, merge=True)
     batch.commit()
     return {"ok": True}
 
 
 # -----------------------------------------------------------------------------
-# Upload endpoint (GCS upload; GCS → Pub/Sub → workers)
+# Upload endpoint (GCS upload; GCS -> Pub/Sub -> workers)
+#
+# NOTE: still the proxy-upload design -- replaced by /upload-url (presigned,
+# direct-to-GCS, auth-gated) in Phase C. Left as-is here deliberately, not
+# an oversight.
 # -----------------------------------------------------------------------------
 
 
@@ -259,7 +289,7 @@ def _map_status_to_ui(
     status: Optional[str],
 ) -> Literal["pending", "processed", "error"]:
     """
-    Map Firestore job.status → UI status enum:
+    Map Firestore job.status -> UI status enum:
       pending | processed | error
     """
     if not status:
@@ -267,12 +297,12 @@ def _map_status_to_ui(
 
     s = status.upper()
 
-    if s in {"NEW", "PENDING", "QUEUED", "INSPECTED", "CLASSIFIED"}:
+    if s in {"NEW", "PENDING", "QUEUED", "INSPECTED", "CLASSIFIED"} or s.endswith("_IN_PROGRESS"):
         return "pending"
     if s in {"ERROR", "FAILED"}:
         return "error"
 
-    # COMPLETED and everything else → processed
+    # COMPLETED and everything else -> processed
     return "processed"
 
 
@@ -290,19 +320,16 @@ def root():
 
 
 @app.get("/activity", response_model=List[ActivityEvent])
-def list_activity(limit: int = 20) -> List[ActivityEvent]:
+def list_activity(limit: int = 20, uid: str = Depends(require_uid)) -> List[ActivityEvent]:
     """
-    Return recent file processing events based on Firestore jobs.
-
-    We read from the same JOBS_COLLECTION that workers update
-    (status, classification, action, etc.) and map each doc to the
-    ActivityEvent shape expected by the UI.
+    Return the caller's own recent file processing events, from
+    users/{uid}/jobs -- the same subcollection the workers will write to
+    once Phase C threads user_id through the pipeline.
     """
     events: List[ActivityEvent] = []
 
-    # newest first
     query = (
-        db.collection(JOBS_COLLECTION)
+        user_jobs_ref(uid)
         .order_by("updated_at", direction=firestore.Query.DESCENDING)
         .limit(limit)
     )
@@ -311,10 +338,8 @@ def list_activity(limit: int = 20) -> List[ActivityEvent]:
         data = doc.to_dict() or {}
         job_id = doc.id
 
-        # Pick a timestamp (updated_at > created_at > now)
         ts_str = data.get("updated_at") or data.get("created_at")
         if ts_str:
-            # strip trailing Z if present
             ts = datetime.fromisoformat(ts_str.replace("Z", ""))
         else:
             ts = datetime.utcnow()
