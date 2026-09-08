@@ -6,3 +6,4 @@ google-cloud-firestore
 python-multipart
 PyPDF2
 pillow
+firebase-admin
